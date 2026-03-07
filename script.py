@@ -10,12 +10,10 @@ URL_BASE = os.getenv("URL_BASE")
 DATA_URL = os.getenv("DATA_URL")
 OUT_FILE = "newfile.json"
 
-# Abstracted paths and headers
-SECURE_PATH = os.getenv("SECURE_PATH")  
-AUTH_KEY = os.getenv("AUTH_KEY")    
-AUTH_VAL = os.getenv("AUTH_VAL")  
+SECURE_PATH = os.getenv("SECURE_PATH")
+AUTH_KEY = os.getenv("AUTH_KEY")
+AUTH_VAL = os.getenv("AUTH_VAL")
 
-# Regex Keywords
 KW_INPUT = os.getenv("KEYWORDS", "")
 KW_LIST = [k.strip() for k in KW_INPUT.split(",")]
 
@@ -65,13 +63,20 @@ def start_session():
         print(f"[SYSTEM] ❌ Auth Error: {e}")
     return False
 
-def api_request(path):
-    # Handshake call with abstracted path
-    session.get(f"{URL_BASE}{SECURE_PATH}{path}&method=GET", headers=COMMON_HEADERS)
-    try:
-        r = session.get(f"{URL_BASE}{path}", headers=COMMON_HEADERS, timeout=25)
-        if r.status_code == 200: return r.json(), True
-    except: pass
+def api_request(path, retries=3):
+    # Handshake
+    for attempt in range(retries):
+        try:
+            session.get(f"{URL_BASE}{SECURE_PATH}{path}&method=GET", headers=COMMON_HEADERS, timeout=10)
+            r = session.get(f"{URL_BASE}{path}", headers=COMMON_HEADERS, timeout=25)
+            if r.status_code == 200:
+                return r.json(), True
+            if r.status_code == 401: # Try re-verifying if unauthorized
+                start_session()
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(1) # Wait before retry
+                continue
     return None, False
 
 def process_item(item, idx, total):
@@ -103,8 +108,11 @@ def process_item(item, idx, total):
                 detail, d_ok = api_request(f"/api/video/{r_item.get('id')}")
                 if d_ok:
                     detail = detail if isinstance(detail, dict) else {}
-                    uri = detail.get("video_url", "")
-                    is_doc = uri.lower().endswith(".pdf")
+                    uri = detail.get("video_url") or "" # Safety: fallback to empty string
+                    
+                    # Safety check: avoid AttributeError if uri is None
+                    is_doc = uri.lower().endswith(".pdf") if uri else False
+                    
                     resolved.append({
                         "id": str(r_item.get("id")),
                         "title": r_item.get("name"),
@@ -120,7 +128,9 @@ def process_item(item, idx, total):
     return True
 
 def main():
-    if not start_session(): return
+    if not start_session(): 
+        print("❌ Handshake Failed.")
+        return
     try:
         payload = session.get(DATA_URL, headers=COMMON_HEADERS).json()
     except: return
@@ -132,7 +142,11 @@ def main():
 
     with ThreadPoolExecutor(max_workers=WORKERS) as engine:
         tasks = [engine.submit(process_item, c, i+1, len(matches)) for i, c in enumerate(matches)]
-        for t in as_completed(tasks): t.result()
+        for t in as_completed(tasks):
+            try:
+                t.result()
+            except Exception as e:
+                print(f"[CRITICAL] Task failed: {e}")
 
 if __name__ == "__main__":
     main()
