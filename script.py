@@ -25,7 +25,7 @@ AUTH_VAL   = os.getenv("AUTH_VAL")
 
 KEYWORDS   = os.getenv("KEYWORDS")
 THREADS    = int(os.getenv("THREADS", 5))
-
+SECURE_PATH=os.getenv("SECURE_PATH")
 OUTPUT_FILE = "newfile.json"
 
 SEARCH_PATTERN = re.compile(KEYWORDS, re.IGNORECASE)
