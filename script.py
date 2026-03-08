@@ -4,10 +4,8 @@ import os
 import time
 import requests
 import json
-import re
 import sys
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -23,13 +21,10 @@ BATCHES_URL = os.getenv("DATA_URL")
 AUTH_KEY    = os.getenv("AUTH_KEY")
 AUTH_VAL    = os.getenv("AUTH_VAL")
 
-KEYWORDS    = os.getenv("KEYWORDS")
 THREADS     = int(os.getenv("THREADS", 5))
 SECURE_PATH = os.getenv("SECURE_PATH")
 
 OUTPUT_FILE = "newfile.json"
-
-SEARCH_PATTERN = re.compile(KEYWORDS, re.IGNORECASE)
 
 # ────────────────────────────────────────────────
 # RETRY CONFIG
@@ -90,9 +85,9 @@ def save_course(course_data):
 # ────────────────────────────────────────────────
 
 def fetch_security_token(path):
-    xyzurl = f"{API_BASE}{SECURE_PATH}?path={path}&method=GET"
+    sunny_url = f"{API_BASE}{SECURE_PATH}?path={path}&method=GET"
     try:
-        r = session.get(xyzurl, headers=HEADERS, timeout=10)
+        r = session.get(sunny_url, headers=HEADERS, timeout=10)
         print(f"[TOKEN] {path} -> {r.status_code}")
         return r.status_code == 200
     except Exception as e:
@@ -316,28 +311,22 @@ def main():
         print(f"[ERROR] Batch fetch failed: {e}")
         return
 
-    filtered = [
-        b for b in all_batches
-        if SEARCH_PATTERN.search(b.get("title", ""))
-    ]
-    print(f"[INIT] Matched courses: {len(filtered)}")
+    all_courses = all_batches
+    total = len(all_courses)
+    print(f"[INIT] Total courses to process: {total}")
 
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
 
-    with ThreadPoolExecutor(max_workers=THREADS) as executor:
-        futures = [
-            executor.submit(fetch_course_details, c, i + 1, len(filtered))
-            for i, c in enumerate(filtered)
-        ]
-        for f in as_completed(futures):
-            f.result()
+    # Process one course at a time — complete before moving to next
+    for i, course in enumerate(all_courses):
+        fetch_course_details(course, i + 1, total)
 
     runtime = round(time.time() - START_TIME, 2)
 
     print("\n========== SUMMARY ==========")
     print(f"Total API Calls : {API_CALLS}")
-    print(f"Courses Scraped : {len(filtered)}")
+    print(f"Courses Scraped : {total}")
     print(f"Skipped Items   : {len(SKIPPED)}")
     print(f"Runtime         : {runtime} seconds")
 
@@ -345,8 +334,6 @@ def main():
         print("\n[SKIPPED PATHS — failed after all retries]")
         for p in SKIPPED:
             print(f"  - {p}")
-
     print("=============================")
-
 if __name__ == "__main__":
     main()
