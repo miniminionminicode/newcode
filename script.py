@@ -1,25 +1,28 @@
 # -*- coding: utf-8 -*-
+
 import os
 import json
 import asyncio
 import aiohttp
+import sys
 from datetime import datetime, timezone
+
+sys.stdout.reconfigure(encoding="utf-8")
+
 # ────────────────────────────────────────────────
 # ENV CONFIG
 # ────────────────────────────────────────────────
 
 URL_BASE = os.getenv("URL_BASE")
-DATA_URL = os.getenv("DATA_URL")
+DATA_URL = os.getenv("DATA_URL")  # course json
 SECURE_PATH = os.getenv("SECURE_PATH")
 
 AUTH_KEY = os.getenv("AUTH_KEY")
 AUTH_VAL = os.getenv("AUTH_VAL")
 
-THREADS = int(os.getenv("THREADS", "40"))
+THREADS = int(os.getenv("THREADS", "25"))
 
 OUT_FILE = "newfile.json"
-
-TARGET_IDS = [848, 849, 391, 329]
 
 COMMON_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -28,16 +31,74 @@ COMMON_HEADERS = {
     AUTH_KEY: AUTH_VAL,
 }
 
-# concurrency limiter
 SEM = asyncio.Semaphore(THREADS)
 
-
 # ────────────────────────────────────────────────
-# LOGGING
+# JSON MERGE (APPEND ONLY)
 # ────────────────────────────────────────────────
 
-def log(msg):
-    print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
+def load_existing():
+
+    if not os.path.exists(OUT_FILE):
+        return []
+
+    try:
+        with open(OUT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def merge_data(old, new):
+
+    course_map = {c["course_id"]: c for c in old}
+
+    for course in new:
+
+        cid = course["course_id"]
+
+        if cid not in course_map:
+            course_map[cid] = course
+            continue
+
+        existing_course = course_map[cid]
+
+        subj_map = {
+            s["subject_id"]: s
+            for s in existing_course.get("subjects", [])
+        }
+
+        for sub in course.get("subjects", []):
+
+            sid = sub["subject_id"]
+
+            if sid not in subj_map:
+                existing_course.setdefault("subjects", []).append(sub)
+                continue
+
+            existing_sub = subj_map[sid]
+
+            existing_items = {
+                x["id"]: x
+                for x in existing_sub.get("content", [])
+            }
+
+            for item in sub.get("content", []):
+
+                if item["id"] not in existing_items:
+                    existing_sub.setdefault("content", []).append(item)
+
+        old_ann = {
+            a.get("id"): a
+            for a in existing_course.get("announcements", [])
+        }
+
+        for ann in course.get("announcements", []):
+
+            if ann.get("id") not in old_ann:
+                existing_course.setdefault("announcements", []).append(ann)
+
+    return list(course_map.values())
 
 
 # ────────────────────────────────────────────────
@@ -52,70 +113,61 @@ async def retry(coro, attempts=3):
             return await coro()
 
         except Exception as e:
-            log(f"Retry {i+1}/{attempts} failed → {e}")
+            print(f"Retry {i+1}/{attempts} → {e}")
             await asyncio.sleep(1)
 
     return None
 
 
 # ────────────────────────────────────────────────
-# SECURE KEY FETCH
-# ────────────────────────────────────────────────
-
-async def obtain_secure_key(session, path):
-
-    async with SEM:
-
-        url = f"{URL_BASE}{SECURE_PATH}{path}&method=GET"
-
-        async with session.get(url, headers=COMMON_HEADERS, timeout=15) as r:
-            log(f"[KEY] {path} → {r.status}")
-
-            return r.status == 200
-
-
-# ────────────────────────────────────────────────
-# VERIFY SESSION
+# AUTH
 # ────────────────────────────────────────────────
 
 async def verify_session(session):
 
-    log("Starting verification handshake")
+    print("[AUTH] Starting Verification Handshake...")
 
-    try:
+    async with session.post(
+        f"{URL_BASE}/generate_link",
+        headers=COMMON_HEADERS,
+        json={}
+    ) as r:
 
-        async with session.post(
-            f"{URL_BASE}/generate_link",
-            headers=COMMON_HEADERS,
-            json={},
-            timeout=20
-        ) as r:
+        data = await r.json()
 
-            data = await r.json()
+    cb = data.get("callback_url")
 
-        cb_url = data.get("callback_url")
+    if not cb:
+        return False
 
-        if not cb_url:
-            return False
+    await session.get(cb, headers=COMMON_HEADERS)
 
-        async with session.get(cb_url, headers=COMMON_HEADERS):
-            pass
+    async with session.get(
+        f"{URL_BASE}/status",
+        headers=COMMON_HEADERS
+    ) as r:
 
-        async with session.get(
-            f"{URL_BASE}/status",
-            headers=COMMON_HEADERS
-        ) as r:
+        status = await r.json()
 
-            status = await r.json()
-
-        if status.get("verified"):
-            log("Session verified")
-            return True
-
-    except Exception as e:
-        log(f"Verification error → {e}")
+    if status.get("verified"):
+        print("[AUTH] Session Verified")
+        return True
 
     return False
+
+
+# ────────────────────────────────────────────────
+# SECURE KEY
+# ────────────────────────────────────────────────
+
+async def get_secure_key(session, path):
+
+    url = f"{URL_BASE}{SECURE_PATH}{path}&method=GET"
+
+    async with SEM:
+
+        async with session.get(url, headers=COMMON_HEADERS):
+            return True
 
 
 # ────────────────────────────────────────────────
@@ -126,14 +178,13 @@ async def api_call(session, path):
 
     async def job():
 
-        await obtain_secure_key(session, path)
+        await get_secure_key(session, path)
 
         async with SEM:
 
             async with session.get(
                 f"{URL_BASE}{path}",
-                headers=COMMON_HEADERS,
-                timeout=20
+                headers=COMMON_HEADERS
             ) as r:
 
                 if r.status == 200:
@@ -141,11 +192,9 @@ async def api_call(session, path):
 
                 if r.status == 401:
 
-                    log("Unauthorized → re-verifying")
-
                     if await verify_session(session):
 
-                        await obtain_secure_key(session, path)
+                        await get_secure_key(session, path)
 
                         async with session.get(
                             f"{URL_BASE}{path}",
@@ -161,49 +210,45 @@ async def api_call(session, path):
 
 
 # ────────────────────────────────────────────────
-# RESOLVE CONTENT
+# VIDEO RESOLVE
 # ────────────────────────────────────────────────
 
 async def resolve_item(session, item):
 
     item_id = item.get("id")
 
-    async def job():
+    data = await api_call(session, f"/api/video/{item_id}")
 
-        data = await api_call(session, f"/api/video/{item_id}")
+    if not data:
+        return None
 
-        if not data:
-            return None
+    v_url = data.get("video_url", "")
 
-        v_url = data.get("video_url", "")
+    final_pdf = data.get("pdf_url")
+    final_m3u8 = None
 
-        final_pdf = data.get("pdf_url")
-        final_m3u8 = None
+    if v_url and v_url.lower().endswith(".pdf"):
+        final_pdf = v_url
+    else:
+        final_m3u8 = v_url
 
-        if v_url and v_url.lower().endswith(".pdf"):
-            final_pdf = v_url
-        else:
-            final_m3u8 = v_url
-
-        return {
-            "id": str(item_id),
-            "title": item.get("name"),
-            "m3u8": final_m3u8,
-            "youtube": data.get("hd_video_url"),
-            "pdf": final_pdf or (
-                data.get("pdfs")[0]["url"]
-                if data.get("pdfs") else None
-            ),
-            "thumbnail": data.get("thumbnail_url") or item.get("thumbnail_url"),
-            "timestamp": data.get("created_at") or item.get("published_at"),
-            "type": "pdf" if final_pdf else "video"
-        }
-
-    return await retry(job)
+    return {
+        "id": str(item_id),
+        "title": item.get("name"),
+        "m3u8": final_m3u8,
+        "youtube": data.get("hd_video_url"),
+        "pdf": final_pdf or (
+            data.get("pdfs")[0]["url"]
+            if data.get("pdfs") else None
+        ),
+        "thumbnail": data.get("thumbnail_url") or item.get("thumbnail_url"),
+        "timestamp": data.get("created_at") or item.get("published_at"),
+        "type": "pdf" if final_pdf else "video"
+    }
 
 
 # ────────────────────────────────────────────────
-# SUBJECT PROCESS
+# SUBJECT
 # ────────────────────────────────────────────────
 
 async def process_subject(session, sub):
@@ -211,7 +256,7 @@ async def process_subject(session, sub):
     sub_id = sub.get("id")
     sub_name = sub.get("name")
 
-    log(f"Subject → {sub_name}")
+    print(f"  └─ Subject: {sub_name}")
 
     lesson_data = await api_call(session, f"/api/lesson/{sub_id}")
 
@@ -240,16 +285,21 @@ async def process_subject(session, sub):
 
 
 # ────────────────────────────────────────────────
-# COURSE SCRAPER
+# COURSE
 # ────────────────────────────────────────────────
 
-async def fetch_course(session, cid):
+async def fetch_course(session, course):
 
-    log(f"Starting course {cid}")
+    cid = course.get("id")
+
+    print(f"\n>>> STARTING COURSE {cid}")
 
     out = {
         "course_id": str(cid),
-        "course_name": f"Course {cid}",
+        "course_name": course.get("title"),
+        "image": course.get("image_thumb"),
+        "image_large": course.get("image_large"),
+        "start_at": course.get("start_at"),
         "subjects": [],
         "announcements": [],
         "fetched_at": datetime.now(timezone.utc).isoformat()
@@ -257,19 +307,18 @@ async def fetch_course(session, cid):
 
     classroom = await api_call(session, f"/api/classroom/{cid}")
 
-    if not classroom:
-        return out
+    if classroom:
 
-    subjects = classroom.get("classroom", [])
+        subjects = classroom.get("classroom", [])
 
-    tasks = [
-        process_subject(session, s)
-        for s in subjects
-    ]
+        tasks = [
+            process_subject(session, s)
+            for s in subjects
+        ]
 
-    results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
 
-    out["subjects"] = [r for r in results if r]
+        out["subjects"] = [r for r in results if r]
 
     updates = await api_call(session, f"/api/updates/{cid}")
 
@@ -290,20 +339,29 @@ async def main():
     async with aiohttp.ClientSession(timeout=timeout) as session:
 
         if not await verify_session(session):
-            log("Verification failed")
             return
 
+        print("[INIT] Loading course list")
+
+        async with session.get(DATA_URL) as r:
+            courses = await r.json()
+
         tasks = [
-            fetch_course(session, cid)
-            for cid in TARGET_IDS
+            fetch_course(session, c)
+            for c in courses
         ]
 
         results = await asyncio.gather(*tasks)
 
-        with open(OUT_FILE, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+        old = load_existing()
 
-        log(f"Saved → {OUT_FILE}")
-# ────────────────────────────────────────────────
+        merged = merge_data(old, results)
+
+        with open(OUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2, ensure_ascii=False)
+
+        print("[FINISH] JSON Updated")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
