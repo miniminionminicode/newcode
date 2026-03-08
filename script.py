@@ -24,7 +24,8 @@ THREADS = int(os.getenv("THREADS", 3))
 COURSE_LIMIT = 1  # Only first course
 
 # Keyword from env, fallback to default
-SEARCH_KEYWORD = os.getenv("SEARCH_KEYWORD")
+
+SEARCH_KEYWORD = os.getenv("KEYWORDS")
 SEARCH_PATTERN = re.compile(SEARCH_KEYWORD, re.IGNORECASE)
 
 COMMON_HEADERS = {
