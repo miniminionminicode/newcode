@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
+
   execute_sync:
 
     runs-on: ubuntu-latest
@@ -23,17 +24,17 @@ jobs:
         run: |
           pip install aiohttp
 
-      - name: Run Ultra Sync Script
+      - name: Run Script
         env:
           URL_BASE: ${{ secrets.URL_BASE }}
           DATA_URL: ${{ secrets.DATA_URL }}
           SECURE_PATH: ${{ secrets.SECURE_PATH }}
           AUTH_KEY: ${{ secrets.AUTH_KEY }}
           AUTH_VAL: ${{ secrets.AUTH_VAL }}
-          THREADS: 80
+          THREADS: 25
         run: python script.py
 
-      - name: Deploy JSON to Storage Repo
+      - name: Push JSON
         env:
           TOKEN: ${{ secrets.MY_PAT }}
         run: |
@@ -43,5 +44,5 @@ jobs:
           git config user.name "Sync-Bot"
           git config user.email "bot@sync.com"
           git add newfile.json
-          git commit -m "Auto Sync: $(date -u)" || exit 0
+          git commit -m "Auto Sync $(date -u)" || exit 0
           git push origin main
