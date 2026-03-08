@@ -8,6 +8,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -17,18 +18,17 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 BASE_URL = os.getenv("URL_BASE")
 API_BASE = f"{BASE_URL}/api"
-
 BATCHES_URL = os.getenv("DATA_URL")
-
-OUTPUT_FILE = "newfile.json"
-
-KEYWORDS = os.getenv("KEYWORDS")
-THREADS = int(os.getenv("THREADS", 5))
 
 SECURE_PATH = os.getenv("SECURE_PATH")
 
 AUTH_KEY = os.getenv("AUTH_KEY")
 AUTH_VAL = os.getenv("AUTH_VAL")
+
+KEYWORDS = os.getenv("KEYWORDS", "bpsc")
+THREADS = int(os.getenv("THREADS", 5))
+
+OUTPUT_FILE = "newfile.json"
 
 SEARCH_PATTERN = re.compile(KEYWORDS, re.IGNORECASE)
 
@@ -37,13 +37,21 @@ SEARCH_PATTERN = re.compile(KEYWORDS, re.IGNORECASE)
 # ────────────────────────────────────────────────
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": f"{BASE_URL}/verify",
     "Origin": BASE_URL,
     AUTH_KEY: AUTH_VAL
 }
 
 session = requests.Session()
+
+# ────────────────────────────────────────────────
+# GLOBAL METRICS
+# ────────────────────────────────────────────────
+
+START_TIME = time.time()
+API_CALLS = 0
+API_LOCK = Lock()
 
 # ────────────────────────────────────────────────
 # FILE SAVE
@@ -63,34 +71,41 @@ def save_course(course_data):
     cid = course_data.get("course_id")
 
     data = [c for c in data if c.get("course_id") != cid]
+
     data.append(course_data)
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+    print(f"[FILE] Course saved -> {course_data.get('course_name')}")
+
 
 # ────────────────────────────────────────────────
-# KEY FETCHER (renamed)
+# TOKEN FETCHER
 # ────────────────────────────────────────────────
 
 def fetch_security_token(path):
 
     url = f"{API_BASE}{SECURE_PATH}?path={path}&method=GET"
 
+    print(f"[TOKEN] Fetching token for {path}")
+
     try:
         r = session.get(url, headers=HEADERS, timeout=10)
+        print(f"[TOKEN] Status {r.status_code}")
         return r.status_code == 200
-    except:
+    except Exception as e:
+        print(f"[TOKEN ERROR] {e}")
         return False
 
 
 # ────────────────────────────────────────────────
-# SESSION VERIFY
+# AUTH HANDSHAKE
 # ────────────────────────────────────────────────
 
 def verify_session():
 
-    print("[AUTH] Starting verification")
+    print("[AUTH] Starting verification handshake")
 
     try:
 
@@ -100,23 +115,29 @@ def verify_session():
             json={}
         )
 
-        cb_url = r.json().get("callback_url")
+        print(f"[AUTH] generate_link status: {r.status_code}")
 
-        if cb_url:
+        cb = r.json().get("callback_url")
 
-            session.get(cb_url, headers=HEADERS)
+        if cb:
+
+            print("[AUTH] Opening callback")
+
+            session.get(cb, headers=HEADERS)
 
             status = session.get(
                 f"{BASE_URL}/status",
                 headers=HEADERS
             ).json()
 
+            print(f"[AUTH] Verification status -> {status}")
+
             if status.get("verified"):
-                print("[AUTH] Session verified")
+                print("[AUTH] Session verified successfully")
                 return True
 
     except Exception as e:
-        print(f"[AUTH] Error: {e}")
+        print(f"[AUTH ERROR] {e}")
 
     return False
 
@@ -126,6 +147,14 @@ def verify_session():
 # ────────────────────────────────────────────────
 
 def safe_api_call(path):
+
+    global API_CALLS
+
+    with API_LOCK:
+        API_CALLS += 1
+        current_call = API_CALLS
+
+    print(f"\n[API-{current_call}] Request -> {path}")
 
     fetch_security_token(path)
 
@@ -139,7 +168,11 @@ def safe_api_call(path):
             timeout=20
         )
 
+        print(f"[API-{current_call}] Status {r.status_code}")
+
         if r.status_code == 401:
+
+            print("[API] 401 Unauthorized -> re-authenticating")
 
             if verify_session():
 
@@ -152,16 +185,20 @@ def safe_api_call(path):
                 )
 
         if r.status_code == 200:
+
+            print(f"[API-{current_call}] Success")
+
             return r.json(), True
 
-    except:
-        pass
+    except Exception as e:
+
+        print(f"[API-{current_call} ERROR] {e}")
 
     return None, False
 
 
 # ────────────────────────────────────────────────
-# COURSE SCRAPER
+# COURSE PROCESSOR
 # ────────────────────────────────────────────────
 
 def fetch_course_details(course, rank, total):
@@ -169,24 +206,20 @@ def fetch_course_details(course, rank, total):
     cid = course.get("id")
     cname = course.get("title") or "Unknown"
 
-    image = course.get("image")
-    image_large = course.get("image_large")
-    start_at = course.get("start_at")
-
-    print(f"\n>>> [{rank}/{total}] STARTING: {cname} (ID: {cid})")
+    print(f"\n========== COURSE {rank}/{total} ==========")
+    print(f"[COURSE] {cname}")
+    print(f"[COURSE] ID: {cid}")
 
     out = {
         "course_id": str(cid),
         "course_name": cname,
-        "image": image,
-        "image_large": image_large,
-        "start_at": start_at,
+        "image": course.get("image"),
+        "image_large": course.get("image_large"),
+        "start_at": course.get("start_at"),
         "subjects": [],
         "announcements": [],
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
-
-    # SUBJECTS
 
     classroom_data, ok = safe_api_call(f"/api/classroom/{cid}")
 
@@ -194,25 +227,35 @@ def fetch_course_details(course, rank, total):
 
         subjects = classroom_data.get("classroom", [])
 
+        print(f"[COURSE] Found {len(subjects)} subjects")
+
         for sub in subjects:
 
             sub_id = sub.get("id")
             sub_name = sub.get("name")
 
-            print(f"  └─ Fetching Subject: {sub_name}")
+            print(f"\n[SUBJECT] {sub_name} (ID: {sub_id})")
 
             lesson_data, l_ok = safe_api_call(f"/api/lesson/{sub_id}")
 
             if not l_ok:
+                print("[SUBJECT] Failed to load lessons")
                 continue
 
-            raw_items = (lesson_data.get("videos") or []) + (lesson_data.get("notes") or [])
+            videos = lesson_data.get("videos") or []
+            notes = lesson_data.get("notes") or []
+
+            print(f"[CONTENT] Videos: {len(videos)} | Notes: {len(notes)}")
+
+            raw_items = videos + notes
 
             resolved_list = []
 
             for item in raw_items:
 
                 item_id = item.get("id")
+
+                print(f"[ITEM] Resolving -> {item.get('name')} (ID {item_id})")
 
                 details, d_ok = safe_api_call(f"/api/video/{item_id}")
 
@@ -252,23 +295,23 @@ def fetch_course_details(course, rank, total):
                         "type": "pdf" if final_pdf else "video"
                     })
 
-            out["subjects"].append({
+            print(f"[SUBJECT] Resolved {len(resolved_list)} items")
 
+            out["subjects"].append({
                 "subject_id": str(sub_id),
                 "subject_name": sub_name,
                 "content": resolved_list
             })
 
-    # ANNOUNCEMENTS
-
     updates_data, u_ok = safe_api_call(f"/api/updates/{cid}")
 
     if u_ok:
+        print(f"[ANNOUNCEMENTS] Found {len(updates_data)} updates")
         out["announcements"] = updates_data if isinstance(updates_data, list) else []
 
     save_course(out)
 
-    print(f">>> Saved: {cname}")
+    print(f"[COURSE DONE] {cname}")
 
     return out
 
@@ -279,15 +322,25 @@ def fetch_course_details(course, rank, total):
 
 def main():
 
+    print("========== SCRAPER START ==========")
+
     if not verify_session():
+        print("[ERROR] Authentication failed")
         return
 
-    print("[INIT] Fetching batch list")
+    print("\n[INIT] Fetching batch list")
 
     try:
-        all_batches = session.get(BATCHES_URL, headers=HEADERS).json()
+
+        all_batches = session.get(
+            BATCHES_URL,
+            headers=HEADERS
+        ).json()
+
+        print(f"[INIT] Total batches available: {len(all_batches)}")
+
     except Exception as e:
-        print("Batch fetch failed:", e)
+        print(f"[ERROR] Batch fetch failed: {e}")
         return
 
     filtered = [
@@ -295,7 +348,7 @@ def main():
         if SEARCH_PATTERN.search(b.get("title", ""))
     ]
 
-    print(f"[INIT] Total Matches: {len(filtered)}")
+    print(f"[INIT] Matched courses: {len(filtered)}")
 
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
@@ -303,13 +356,20 @@ def main():
     with ThreadPoolExecutor(max_workers=THREADS) as executor:
 
         futures = [
-            executor.submit(fetch_course_details, c, i + 1, len(filtered))
+            executor.submit(fetch_course_details, c, i+1, len(filtered))
             for i, c in enumerate(filtered)
         ]
 
         for f in as_completed(futures):
             f.result()
-    print("\n[FINISH] Scrape complete")
+
+    runtime = round(time.time() - START_TIME, 2)
+
+    print("\n========== SUMMARY ==========")
+    print(f"Total API Calls : {API_CALLS}")
+    print(f"Courses Scraped : {len(filtered)}")
+    print(f"Runtime         : {runtime} seconds")
+    print("=============================")
 
 
 if __name__ == "__main__":
