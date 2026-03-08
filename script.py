@@ -21,7 +21,6 @@ BATCHES_URL = os.getenv("DATA_URL")
 AUTH_KEY    = os.getenv("AUTH_KEY")
 AUTH_VAL    = os.getenv("AUTH_VAL")
 
-THREADS     = int(os.getenv("THREADS", 5))
 SECURE_PATH = os.getenv("SECURE_PATH")
 
 OUTPUT_FILE = "newfile.json"
@@ -30,10 +29,10 @@ OUTPUT_FILE = "newfile.json"
 # RETRY CONFIG
 # ────────────────────────────────────────────────
 
-MAX_RETRIES      = 20    # max retries per API call
-RETRY_BASE_DELAY = 5     # seconds to wait on first 429
-RETRY_MAX_DELAY  = 60    # cap backoff at 60 seconds
-RATE_LIMIT_PAUSE = 10    # extra pause added on top of backoff for 429
+MAX_RETRIES      = 20
+RETRY_BASE_DELAY = 5
+RETRY_MAX_DELAY  = 60
+RATE_LIMIT_PAUSE = 10
 
 # ────────────────────────────────────────────────
 # HEADERS
@@ -56,29 +55,198 @@ START_TIME = time.time()
 API_CALLS  = 0
 API_LOCK   = Lock()
 SKIP_LOCK  = Lock()
-SKIPPED    = []   # paths skipped after all retries exhausted
+SKIPPED    = []
 
 # ────────────────────────────────────────────────
-# FILE SAVE
+# MERGE HELPERS
 # ────────────────────────────────────────────────
 
-def save_course(course_data):
-    data = []
+def better(new_val, old_val):
+    """Returns True if new_val is a real improvement over old_val."""
+    if new_val is None or new_val == "" or new_val == "error":
+        return False
+    if old_val is None or old_val == "" or old_val == "error":
+        return True
+    return False  # both have values — keep old, don't overwrite
+
+
+def merge_item(old_item, new_item):
+    """
+    Merge a new video/pdf item into the existing one.
+    Only update fields where new value is better than old.
+    Never remove or null-out existing good data.
+    """
+    merged = dict(old_item)  # start from old as base
+
+    for field in ["title", "m3u8", "youtube", "pdf", "thumbnail", "timestamp"]:
+        new_val = new_item.get(field)
+        old_val = old_item.get(field)
+        if better(new_val, old_val):
+            merged[field] = new_val
+            print(f"    [MERGE] '{field}' updated: {old_val} → {new_val}")
+
+    # type: only update if old was error or null
+    if old_item.get("type") in (None, "", "error") and new_item.get("type") not in (None, "", "error"):
+        merged["type"] = new_item["type"]
+
+    # remove error flag if item now resolved successfully
+    if new_item.get("type") not in (None, "", "error") and "error" in merged:
+        del merged["error"]
+
+    return merged
+
+
+def merge_items(old_items, new_items):
+    """
+    Merge two lists of content items (videos/pdfs).
+    - Existing items: smart field-level merge
+    - Brand new items (not in old): add them
+    - Items only in old (API didn't return them): keep as-is
+    """
+    old_map = {item["id"]: item for item in old_items}
+    new_map = {item["id"]: item for item in new_items}
+
+    result = []
+
+    # Process all old items — merge with new if available, else keep old
+    for item_id, old_item in old_map.items():
+        if item_id in new_map:
+            new_item = new_map[item_id]
+            # Only merge if new item is not an error
+            if new_item.get("type") == "error":
+                print(f"    [KEEP] Item {item_id} — new fetch failed, keeping old data")
+                result.append(old_item)
+            else:
+                result.append(merge_item(old_item, new_item))
+        else:
+            # Not returned by API this time — keep old untouched
+            print(f"    [KEEP] Item {item_id} — not in new fetch, keeping old data")
+            result.append(old_item)
+
+    # Add brand new items that didn't exist before
+    for item_id, new_item in new_map.items():
+        if item_id not in old_map:
+            print(f"    [NEW] Item {item_id} — '{new_item.get('title')}' added")
+            result.append(new_item)
+
+    return result
+
+
+def merge_subjects(old_subjects, new_subjects):
+    """
+    Merge subject lists.
+    - Existing subjects: merge content items
+    - New subjects: add them
+    - Old subjects not returned by API: keep as-is
+    """
+    old_map = {s["subject_id"]: s for s in old_subjects}
+    new_map = {s["subject_id"]: s for s in new_subjects}
+
+    result = []
+
+    for sub_id, old_sub in old_map.items():
+        if sub_id in new_map:
+            new_sub = new_map[sub_id]
+            # Merge content items
+            merged_content = merge_items(
+                old_sub.get("content", []),
+                new_sub.get("content", [])
+            )
+            result.append({
+                "subject_id":   sub_id,
+                "subject_name": new_sub.get("subject_name") or old_sub.get("subject_name"),
+                "content":      merged_content,
+            })
+            print(f"  [SUBJECT MERGED] {old_sub.get('subject_name')} — {len(merged_content)} items")
+        else:
+            # Subject not returned this run — keep old entirely
+            print(f"  [SUBJECT KEEP] {old_sub.get('subject_name')} — not in new fetch, keeping")
+            result.append(old_sub)
+
+    for sub_id, new_sub in new_map.items():
+        if sub_id not in old_map:
+            print(f"  [SUBJECT NEW] {new_sub.get('subject_name')} — added fresh")
+            result.append(new_sub)
+
+    return result
+
+
+def merge_announcements(old_list, new_list):
+    """Merge announcements — add new ones, keep all old ones, no duplicates."""
+    if not new_list:
+        return old_list  # new fetch failed or empty — keep old
+    old_ids = {a.get("id") for a in old_list if a.get("id")}
+    merged = list(old_list)
+    for ann in new_list:
+        if ann.get("id") not in old_ids:
+            merged.append(ann)
+            print(f"  [ANNOUNCEMENT NEW] id={ann.get('id')}")
+    return merged
+
+
+# ────────────────────────────────────────────────
+# JSON LOAD / SAVE
+# ────────────────────────────────────────────────
+
+def load_json():
     if os.path.exists(OUTPUT_FILE):
         try:
             with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                return json.load(f)
         except:
-            data = []
+            pass
+    return []
 
-    cid  = course_data.get("course_id")
-    data = [c for c in data if c.get("course_id") != cid]
-    data.append(course_data)
 
+def save_json(data):
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-    print(f"[FILE] Course saved -> {course_data.get('course_name')}")
+
+def save_course(course_data):
+    """Smart save: merge with existing data, never overwrite good data with empty/error."""
+    all_data = load_json()
+    cid      = course_data.get("course_id")
+
+    existing = next((c for c in all_data if c.get("course_id") == cid), None)
+
+    if existing:
+        print(f"\n[SAVE] Merging course: {course_data.get('course_name')}")
+
+        merged = dict(existing)  # base = existing
+
+        # Top-level scalar fields — only update if new value is better
+        for field in ["course_name", "image", "image_large", "start_at"]:
+            if better(course_data.get(field), existing.get(field)):
+                merged[field] = course_data[field]
+
+        # Subjects — smart merge
+        if course_data.get("subjects"):
+            merged["subjects"] = merge_subjects(
+                existing.get("subjects", []),
+                course_data.get("subjects", [])
+            )
+        else:
+            print(f"  [KEEP] Subjects — new fetch returned nothing, keeping old")
+
+        # Announcements — additive merge
+        merged["announcements"] = merge_announcements(
+            existing.get("announcements", []),
+            course_data.get("announcements", [])
+        )
+
+        merged["fetched_at"] = course_data["fetched_at"]
+
+        all_data = [c for c in all_data if c.get("course_id") != cid]
+        all_data.append(merged)
+
+    else:
+        print(f"\n[SAVE] New course: {course_data.get('course_name')}")
+        all_data.append(course_data)
+
+    save_json(all_data)
+    print(f"[FILE] Saved -> {course_data.get('course_name')}")
+
 
 # ────────────────────────────────────────────────
 # TOKEN FETCHER
@@ -94,6 +262,7 @@ def fetch_security_token(path):
         print(f"[TOKEN ERROR] {e}")
         return False
 
+
 # ────────────────────────────────────────────────
 # AUTH HANDSHAKE
 # ────────────────────────────────────────────────
@@ -103,7 +272,6 @@ def verify_session():
     try:
         r = session.post(f"{BASE_URL}/generate_link", headers=HEADERS, json={})
         print(f"[AUTH] generate_link status: {r.status_code}")
-
         cb = r.json().get("callback_url")
         if cb:
             session.get(cb, headers=HEADERS)
@@ -116,8 +284,9 @@ def verify_session():
         print(f"[AUTH ERROR] {e}")
     return False
 
+
 # ────────────────────────────────────────────────
-# SAFE API CALL  — retry up to MAX_RETRIES times
+# SAFE API CALL
 # ────────────────────────────────────────────────
 
 def safe_api_call(path, label=""):
@@ -139,32 +308,27 @@ def safe_api_call(path, label=""):
             r = session.get(f"{BASE_URL}{path}", headers=HEADERS, timeout=20)
             print(f"{tag} Attempt {attempt}/{MAX_RETRIES} -> HTTP {r.status_code}")
 
-            # ── 200 OK ───────────────────────────────────────────
             if r.status_code == 200:
                 return r.json(), True
 
-            # ── 429 Too Many Requests → exponential backoff ──────
             elif r.status_code == 429:
                 wait = min(RETRY_BASE_DELAY * attempt, RETRY_MAX_DELAY)
                 total_wait = wait + RATE_LIMIT_PAUSE
                 print(f"{tag} ⚠️  429 Rate-limited. Pausing {total_wait}s before retry {attempt}/{MAX_RETRIES} ...")
                 time.sleep(total_wait)
 
-            # ── 401 Unauthorized → re-auth once then retry ───────
             elif r.status_code == 401:
                 print(f"{tag} 401 Unauthorized -> re-authenticating ...")
                 if verify_session():
-                    continue   # retry immediately after re-auth
+                    continue
                 else:
-                    break      # can't recover
+                    break
 
-            # ── 5xx Server Error → backoff and retry ─────────────
             elif r.status_code >= 500:
                 wait = min(RETRY_BASE_DELAY * attempt, RETRY_MAX_DELAY)
                 print(f"{tag} Server error {r.status_code}. Waiting {wait}s ...")
                 time.sleep(wait)
 
-            # ── 403 / 404 / other → unrecoverable, skip now ──────
             else:
                 print(f"{tag} Unrecoverable status {r.status_code}. Skipping.")
                 break
@@ -179,11 +343,11 @@ def safe_api_call(path, label=""):
             print(f"{tag} Exception: {e}. Waiting {wait}s ...")
             time.sleep(wait)
 
-    # ── All retries exhausted ────────────────────────────────────
     print(f"{tag} ❌ SKIPPED after {MAX_RETRIES} retries -> {path}")
     with SKIP_LOCK:
         SKIPPED.append(path)
     return None, False
+
 
 # ────────────────────────────────────────────────
 # COURSE PROCESSOR
@@ -196,19 +360,24 @@ def fetch_course_details(course, rank, total):
     print(f"\n========== COURSE {rank}/{total} ==========")
     print(f"[COURSE] {cname}  (ID: {cid})")
 
+    # Load whatever we already have for this course
+    existing_data = load_json()
+    existing      = next((c for c in existing_data if c.get("course_id") == str(cid)), None)
+
     out = {
         "course_id":     str(cid),
         "course_name":   cname,
         "image":         course.get("image"),
         "image_large":   course.get("image_large"),
         "start_at":      course.get("start_at"),
-        "subjects":      [],
+        "subjects":      [],        # will be filled or left empty (merge handles preservation)
         "announcements": [],
         "fetched_at":    datetime.now(timezone.utc).isoformat(),
     }
 
-    # 1. Subjects
+    # ── 1. Subjects ──────────────────────────────────────────────
     classroom_data, ok = safe_api_call(f"/api/classroom/{cid}", "classroom")
+
     if ok:
         subjects = classroom_data.get("classroom", [])
         print(f"[COURSE] Found {len(subjects)} subjects")
@@ -219,8 +388,15 @@ def fetch_course_details(course, rank, total):
             print(f"\n[SUBJECT] {sub_name} (ID: {sub_id})")
 
             lesson_data, l_ok = safe_api_call(f"/api/lesson/{sub_id}", "lesson")
+
             if not l_ok:
-                print("[SUBJECT] Failed to load lessons — skipping subject")
+                # API failed — pass empty content, merge will preserve old
+                print(f"[SUBJECT] ⚠️  Lesson fetch failed — old data will be preserved by merge")
+                out["subjects"].append({
+                    "subject_id":   str(sub_id),
+                    "subject_name": sub_name,
+                    "content":      [],   # merge will keep old content
+                })
                 continue
 
             videos = lesson_data.get("videos") or []
@@ -262,7 +438,7 @@ def fetch_course_details(course, rank, total):
                         "type":      "pdf" if final_pdf else "video",
                     })
                 else:
-                    # Placeholder so item is still present in output with error flag
+                    # Failed — add error placeholder; merge will keep old if exists
                     resolved_list.append({
                         "id":        str(item_id),
                         "title":     item_name,
@@ -282,15 +458,25 @@ def fetch_course_details(course, rank, total):
                 "content":      resolved_list,
             })
 
-    # 2. Announcements
+    else:
+        # Classroom API failed entirely — out["subjects"] stays []
+        # merge_subjects in save_course will see empty new subjects
+        # and preserve ALL old subjects untouched
+        print(f"[COURSE] ⚠️  Classroom fetch failed — all old subjects will be preserved by merge")
+
+    # ── 2. Announcements ─────────────────────────────────────────
     updates_data, u_ok = safe_api_call(f"/api/updates/{cid}", "updates")
     if u_ok:
-        print(f"[ANNOUNCEMENTS] Found {len(updates_data)} updates")
         out["announcements"] = updates_data if isinstance(updates_data, list) else []
+    else:
+        print(f"[COURSE] ⚠️  Announcements fetch failed — old announcements will be preserved by merge")
+        # leave out["announcements"] = [] — merge_announcements keeps old when new is empty
 
+    # ── Smart save / merge ───────────────────────────────────────
     save_course(out)
     print(f"[COURSE DONE] {cname}")
     return out
+
 
 # ────────────────────────────────────────────────
 # MAIN
@@ -311,15 +497,12 @@ def main():
         print(f"[ERROR] Batch fetch failed: {e}")
         return
 
-    all_courses = all_batches
-    total = len(all_courses)
+    total = len(all_batches)
     print(f"[INIT] Total courses to process: {total}")
 
-    if os.path.exists(OUTPUT_FILE):
-        os.remove(OUTPUT_FILE)
+    # ── NO os.remove(OUTPUT_FILE) — we never wipe existing data ──
 
-    # Process one course at a time — complete before moving to next
-    for i, course in enumerate(all_courses):
+    for i, course in enumerate(all_batches):
         fetch_course_details(course, i + 1, total)
 
     runtime = round(time.time() - START_TIME, 2)
@@ -334,6 +517,9 @@ def main():
         print("\n[SKIPPED PATHS — failed after all retries]")
         for p in SKIPPED:
             print(f"  - {p}")
+
     print("=============================")
+
+
 if __name__ == "__main__":
     main()
