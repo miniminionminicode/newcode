@@ -1,46 +1,48 @@
 name: Data Sync
 
 on:
-  schedule:
-    - cron: "0 */3 * * *"
   workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *' # Runs daily at 03:00 UTC
 
 jobs:
-  execute_sync:
+  scrape:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Source
-        uses: actions/checkout@v4
 
-      - name: Setup Python
+    env:
+      URL_BASE: ${{ secrets.URL_BASE }}
+      DATA_URL: ${{ secrets.DATA_URL }}
+      SECURE_PATH: ${{ secrets.SECURE_PATH }}
+      AUTH_KEY: ${{ secrets.AUTH_KEY }}
+      AUTH_VAL: ${{ secrets.AUTH_VAL }}
+      KEYWORDS: ${{ secrets.KEYWORDS }}
+      THREADS: 5
+      MY_PAT: ${{ secrets.MY_PAT }}  # For pushing JSON
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: 3.11
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Script
-        env:
-          URL_BASE: ${{ secrets.URL_BASE }}
-          DATA_URL: ${{ secrets.DATA_URL }}
-          SECURE_PATH: ${{ secrets.SECURE_PATH }}
-          AUTH_KEY: ${{ secrets.AUTH_KEY }}
-          AUTH_VAL: ${{ secrets.AUTH_VAL }}
-          THREADS: 5
+      - name: Run scraper
         run: python script.py
 
-      - name: Deploy to Storage Repo
-        env:
-          TOKEN: ${{ secrets.MY_PAT }}
+      - name: Push JSON to storage repo
         run: |
-          git clone https://x-access-token:${{ secrets.MY_PAT }}@github.com/${{ github.repository_owner }}/k.git k_repo
+          git clone https://x-access-token:${MY_PAT}@github.com/${{ github.repository_owner }}/k.git k_repo
           mv newfile.json k_repo/
           cd k_repo
           git config user.name "Sync-Bot"
           git config user.email "bot@sync.com"
           git add newfile.json
-          git commit -m "Auto-Sync: $(date -u)" || exit 0
+          git commit -m "Auto-Sync: $(date -u)" || echo "No changes to commit"
           git push origin main
