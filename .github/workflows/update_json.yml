@@ -7,39 +7,41 @@ on:
 
 jobs:
   execute_sync:
+
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Source
         uses: actions/checkout@v4
 
-      - name: Setup Environment
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.11"
 
-      - name: Install Libs
-        run: pip install requests
+      - name: Install Dependencies
+        run: |
+          pip install aiohttp
 
-      - name: Run Script
+      - name: Run Ultra Sync Script
         env:
           URL_BASE: ${{ secrets.URL_BASE }}
           DATA_URL: ${{ secrets.DATA_URL }}
           SECURE_PATH: ${{ secrets.SECURE_PATH }}
           AUTH_KEY: ${{ secrets.AUTH_KEY }}
           AUTH_VAL: ${{ secrets.AUTH_VAL }}
-          KEYWORDS: ${{ secrets.KEYWORDS }}
-          THREADS: 25
+          THREADS: 80
         run: python script.py
 
-      - name: Deploy to Storage Repo
+      - name: Deploy JSON to Storage Repo
         env:
           TOKEN: ${{ secrets.MY_PAT }}
         run: |
-          git clone https://x-access-token:${{ secrets.MY_PAT }}@github.com/${{ github.repository_owner }}/k.git k_repo
-          mv newfile.json k_repo/
-          cd k_repo
+          git clone https://x-access-token:${{ secrets.MY_PAT }}@github.com/${{ github.repository_owner }}/k.git storage
+          mv newfile.json storage/
+          cd storage
           git config user.name "Sync-Bot"
           git config user.email "bot@sync.com"
           git add newfile.json
-          git commit -m "Auto-Sync: $(date -u)" || exit 0
+          git commit -m "Auto Sync: $(date -u)" || exit 0
           git push origin main
