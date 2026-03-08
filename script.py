@@ -24,7 +24,7 @@ VAULT_PATH = os.getenv("SECURE_PATH")
 A_KEY = os.getenv("AUTH_KEY")
 A_VAL = os.getenv("AUTH_VAL")
 
-SEARCH_PATTERN = re.compile(os.getenv("KEYWORDS")
+SEARCH_PATTERN = re.compile(os.getenv("KEYWORDS"))
 
 # --- SETTINGS ---
 THREADS = int(os.getenv("THREADS", "5"))
