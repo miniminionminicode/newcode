@@ -272,7 +272,7 @@ def verify_session():
     try:
         r = session.post(f"{BASE_URL}/generate_link", headers=HEADERS, json={})
         print(f"[AUTH] generate_link status: {r.status_code}")
-        cb = r.json().get("callback_url")
+        cb = r.json().get("short_url")
         if cb:
             session.get(cb, headers=HEADERS)
             status = session.get(f"{BASE_URL}/status", headers=HEADERS).json()
