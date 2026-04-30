@@ -2,8 +2,8 @@ name: Data Sync
 
 on:
   workflow_dispatch:
-  #schedule:
-  #  - cron: '30 15 * * *' # Runs daily at 03:00 UTC
+  schedule:
+    - cron: '30 15 * * *' # Runs daily at 03:00 UTC
 
 jobs:
   scrape:
